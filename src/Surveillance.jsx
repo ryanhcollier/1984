@@ -3,13 +3,10 @@ import { Canvas, useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
 import './Surveillance.css';
 
-const SecurityScreen = ({ video }) => {
+const SecurityScreen = ({ video, motionPos }) => {
   const materialRef = useRef();
   const shaderArgs = useMemo(() => {
     const tex = new THREE.VideoTexture(video);
-    tex.minFilter = THREE.LinearFilter;
-    tex.magFilter = THREE.LinearFilter;
-
     return {
       uniforms: { 
         tDiffuse: { value: tex },
@@ -35,10 +32,6 @@ const SecurityScreen = ({ video }) => {
         uniform float uBlur;
         varying vec2 vUv;
 
-        float random(vec2 p) {
-          return fract(sin(dot(p.xy + uTime * 0.1, vec2(12.9898, 78.233))) * 43758.5453123);
-        }
-
         void main() {
           vec2 uv = (vUv - 0.5) / uScale + 0.5 + uOffset;
           vec2 dUv = uv - 0.5;
@@ -47,56 +40,35 @@ const SecurityScreen = ({ video }) => {
 
           vec4 texel = texture2D(tDiffuse, uv);
           if(uBlur > 0.001) {
-             texel += texture2D(tDiffuse, uv + vec2(uBlur, 0.001));
-             texel += texture2D(tDiffuse, uv - vec2(uBlur, 0.001));
+             texel += texture2D(tDiffuse, uv + vec2(uBlur, 0.0));
+             texel += texture2D(tDiffuse, uv - vec2(uBlur, 0.0));
              texel /= 3.0;
           }
 
           float gray = dot(texel.rgb, vec3(0.299, 0.587, 0.114));
-          float noise = random(vUv) * 0.03; 
-          float scanLine = sin(vUv.y * 1100.0) * 0.015; 
+          gray += (fract(sin(dot(vUv + uTime, vec2(12.9, 78.2))) * 437.5) * 0.03) - (sin(vUv.y * 1100.0) * 0.015);
           
-          gray += noise - 0.015 - scanLine;
           gl_FragColor = vec4(vec3(gray), 1.0);
         }
       `
     };
   }, [video]);
 
-  const behavior = useRef({
-    targetPos: new THREE.Vector2(0, 0),
-    isZooming: false,
-    nextActionTime: 0
-  });
-
   useFrame((state) => {
     const t = state.clock.getElapsedTime();
-    const material = materialRef.current;
-    if (!material) return;
+    if (materialRef.current) {
+      materialRef.current.uniforms.uTime.value = t;
+      
+      const target = new THREE.Vector2((motionPos.x - 0.5) * 0.6, (0.5 - motionPos.y) * 0.4);
+      materialRef.current.uniforms.uOffset.value.lerp(target, 0.05);
 
-    if (shaderArgs.uniforms.tDiffuse.value) shaderArgs.uniforms.tDiffuse.value.needsUpdate = true;
-    material.uniforms.uTime.value = t;
-
-    if (t > behavior.current.nextActionTime) {
-      const decision = Math.random();
-      if (decision > 0.6) {
-        behavior.current.isZooming = true;
-        behavior.current.nextActionTime = t + 4 + Math.random() * 2;
+      if (motionPos.active) {
+        materialRef.current.uniforms.uScale.value = THREE.MathUtils.lerp(materialRef.current.uniforms.uScale.value, 2.5, 0.02);
+        materialRef.current.uniforms.uBlur.value = Math.abs(Math.sin(t * 2.0)) * 0.003;
       } else {
-        behavior.current.isZooming = false;
-        behavior.current.targetPos.set((Math.random() - 0.5) * 0.55, (Math.random() - 0.5) * 0.45);
-        behavior.current.nextActionTime = t + 5 + Math.random() * 5;
+        materialRef.current.uniforms.uScale.value = THREE.MathUtils.lerp(materialRef.current.uniforms.uScale.value, 1.0, 0.01);
+        materialRef.current.uniforms.uBlur.value = THREE.MathUtils.lerp(materialRef.current.uniforms.uBlur.value, 0.0, 0.1);
       }
-    }
-
-    material.uniforms.uOffset.value.lerp(behavior.current.targetPos, 0.012);
-
-    if (behavior.current.isZooming) {
-      material.uniforms.uScale.value = THREE.MathUtils.lerp(material.uniforms.uScale.value, 3.5, 0.02);
-      material.uniforms.uBlur.value = Math.abs(Math.sin(t * 1.5)) * 0.002;
-    } else {
-      material.uniforms.uScale.value = THREE.MathUtils.lerp(material.uniforms.uScale.value, 1.05, 0.01);
-      material.uniforms.uBlur.value = THREE.MathUtils.lerp(material.uniforms.uBlur.value, 0.0, 0.05);
     }
   });
 
@@ -110,10 +82,45 @@ const SecurityScreen = ({ video }) => {
 
 const Surveillance = () => {
   const [videoReady, setVideoReady] = useState(false);
-  const [logs, setLogs] = useState([]);
+  const [motionPos, setMotionPos] = useState({ x: 0.5, y: 0.5, active: false });
   const [intelQueue, setIntelQueue] = useState([]);
   const [location, setLocation] = useState(null);
   const videoRef = useRef(null);
+  const canvasRef = useRef(document.createElement('canvas'));
+  const prevFrame = useRef(null);
+
+  useEffect(() => {
+    if (!videoReady) return;
+    const ctx = canvasRef.current.getContext('2d', { willReadFrequently: true });
+    canvasRef.current.width = 64;
+    canvasRef.current.height = 48;
+
+    const trackMotion = () => {
+      ctx.drawImage(videoRef.current, 0, 0, 64, 48);
+      const currentFrame = ctx.getImageData(0, 0, 64, 48);
+      
+      if (prevFrame.current) {
+        let totalX = 0, totalY = 0, count = 0;
+        for (let i = 0; i < currentFrame.data.length; i += 4) {
+          const diff = Math.abs(currentFrame.data[i] - prevFrame.current.data[i]);
+          if (diff > 40) {
+            const pixelIndex = i / 4;
+            totalX += pixelIndex % 64;
+            totalY += Math.floor(pixelIndex / 64);
+            count++;
+          }
+        }
+        if (count > 10) {
+          setMotionPos({ x: totalX / count / 64, y: totalY / count / 48, active: true });
+        } else {
+          setMotionPos(prev => ({ ...prev, active: false }));
+        }
+      }
+      prevFrame.current = currentFrame;
+      requestAnimationFrame(trackMotion);
+    };
+    trackMotion();
+  }, [videoReady]);
 
   useEffect(() => {
     const video = document.createElement('video');
@@ -123,43 +130,12 @@ const Surveillance = () => {
     fetch('https://ipwho.is/').then(res => res.json()).then(data => setLocation(data));
   }, []);
 
-  useEffect(() => {
-    if (!videoReady) return;
-    const interval = setInterval(() => {
-      const phrases = [
-        `SUBJ_ID: ${Math.random().toString(36).substring(7).toUpperCase()}`,
-        `BIO_MATCH: ${(Math.random() * 100).toFixed(2)}%`,
-        `OBJ_COUNT: ${Math.floor(Math.random() * 12)}`,
-        `THERMAL: ${(36.2 + Math.random()).toFixed(1)}°C`,
-        `RECOG_PASS: VALIDATED`,
-        `GAIT_ANALYSIS: STABLE`,
-        `PULSE_EST: ${Math.floor(Math.random() * 30) + 70} BPM`,
-        `ANOMALY_PROB: ${(Math.random() * 5).toFixed(2)}%`,
-        `THOUGHT_PATTERN: DEVIANT`,
-        `LOYALTY_SCORE: ${(Math.random() * 40 + 60).toFixed(1)}%`
-      ];
-      
-      const newEntry = {
-        text: phrases[Math.floor(Math.random() * phrases.length)],
-        isWarning: Math.random() > 0.85 
-      };
-
-      setIntelQueue(prev => [newEntry, ...prev].slice(0, 6));
-      setLogs(prev => [`[${new Date().toLocaleTimeString()}] THOUGHT_SCAN_${Math.random().toString(16).slice(2, 6)}`, ...prev].slice(0, 15));
-    }, 1800);
-    return () => clearInterval(interval);
-  }, [videoReady]);
-
   const handleStart = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
       videoRef.current.srcObject = stream;
-      videoRef.current.onloadeddata = () => {
-        videoRef.current.play().then(() => setVideoReady(true));
-      };
-    } catch (err) {
-      alert("System access denied.");
-    }
+      videoRef.current.onloadeddata = () => videoRef.current.play().then(() => setVideoReady(true));
+    } catch (err) { alert("Access Denied."); }
   };
 
   return (
@@ -168,45 +144,35 @@ const Surveillance = () => {
         <div className="boot-screen">
           <div className="ministry-intro">
             <h1 className="typewriter-title">The Ministry of Love</h1>
-            <p className="typewriter-text">War is peace.</p>
-            <p className="typewriter-text">Freedom is slavery.</p>
-            <p className="typewriter-text">Ignorance is strength</p>
+            <p className="typewriter-text">War is peace. Freedom is slavery. Ignorance is strength</p>
             <button className="init-btn main-btn" onClick={handleStart}>Start Watching</button>
           </div>
         </div>
       ) : (
         <>
           <div className="telemetry-sidebar left">
-            <div className="intel-stack">
-              {intelQueue.map((item, i) => (
-                <div key={i} className={`intel-line ${item.isWarning ? 'warning' : ''}`}>
-                  {item.text}
-                </div>
-              ))}
-            </div>
             <div className="sys-header">
               // BIG BROTHER <br />
               // THOUGHT CRIME REPORTING DIV. <br />
               // Active_Intel_Stream
             </div>
-            <div className="log-container">
-              {logs.map((log, i) => <div key={i} className="log-entry">{log}</div>)}
+            <div className="intel-stack">
+              {motionPos.active && <div className="intel-line warning">MOTION_CRIME_DETECTED</div>}
+              <div className="intel-line">POS_X: {motionPos.x.toFixed(2)}</div>
+              <div className="intel-line">POS_Y: {motionPos.y.toFixed(2)}</div>
             </div>
           </div>
-
           <div className="telemetry-sidebar right">
-            <div className="recording-status">
-              <span className="rec-text">LIVE // ARCHIVING</span>
-              <div className="rec-dot" />
-            </div>
-            <div className="sys-header">TARGET_QUADRANT: {location?.city?.toUpperCase()}</div>
-            <div className="log-entry">IP_RECOGNITION: {location?.ip}</div>
-            <div className="log-entry">NETWORK: {location?.connection?.isp?.toUpperCase()}</div>
+             <div className="recording-status">
+               <span className="rec-text">LIVE_CV_TRACKING</span>
+               <div className="rec-dot" />
+             </div>
+             <div className="sys-header">TARGET_QUADRANT: {location?.city?.toUpperCase()}</div>
+             <div className="log-entry">IP_RECOGNITION: {location?.ip}</div>
           </div>
-
-          <Canvas orthographic gl={{ antialias: false }}>
+          <Canvas orthographic>
             <Suspense fallback={null}>
-              <SecurityScreen video={videoRef.current} />
+              <SecurityScreen video={videoRef.current} motionPos={motionPos} />
             </Suspense>
           </Canvas>
         </>
