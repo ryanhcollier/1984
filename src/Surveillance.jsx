@@ -15,7 +15,8 @@ const SecurityScreen = ({ video, motionPos, isTargeted, isCenter }) => {
         uScale: { value: 1.0 },
         uOffset: { value: new THREE.Vector2(0, 0) },
         uIsTargeted: { value: isTargeted ? 1.0 : 0.0 },
-        uIsCenter: { value: isCenter ? 1.0 : 0.0 }
+        uIsCenter: { value: isCenter ? 1.0 : 0.0 },
+        uFisheyeStrength: { value: 0.5 }
       },
       vertexShader: `
         varying vec2 vUv;
@@ -32,28 +33,89 @@ const SecurityScreen = ({ video, motionPos, isTargeted, isCenter }) => {
         uniform vec2 uOffset;
         uniform float uIsTargeted;
         uniform float uIsCenter;
+        uniform float uFisheyeStrength;
         varying vec2 vUv;
+
+        // Simple noise function
+        float random(vec2 st) {
+          return fract(sin(dot(st.xy, vec2(12.9898,78.233))) * 43758.5453123);
+        }
+
+        float noise(vec2 st) {
+          vec2 i = floor(st);
+          vec2 f = fract(st);
+          float a = random(i);
+          float b = random(i + vec2(1.0, 0.0));
+          float c = random(i + vec2(0.0, 1.0));
+          float d = random(i + vec2(1.0, 1.0));
+          vec2 u = f * f * (3.0 - 2.0 * f);
+          return mix(a, b, u.x) + (c - a)* u.y * (1.0 - u.x) + (d - b) * u.x * u.y;
+        }
 
         void main() {
           vec2 uv = vUv;
           
+          // Apply fisheye distortion for center screen (barrel distortion)
+          if(uIsCenter > 0.5) {
+            vec2 center = vec2(0.5, 0.5);
+            vec2 dUv = vUv - center;
+            float dist = length(dUv);
+            
+            // Apply barrel distortion: compress sampling coordinates toward center
+            // This creates fisheye effect while keeping video full screen
+            float distortionFactor = 1.0 - uFisheyeStrength * dist * dist * 0.5;
+            vec2 fisheyeUv = center + dUv * distortionFactor;
+            
+            // Ensure we stay within valid UV range
+            uv = clamp(fisheyeUv, 0.0, 1.0);
+          }
+          
           if(uIsTargeted > 0.5) {
-            uv = (vUv - 0.5) / uScale + 0.5 + uOffset;
+            uv = (uv - 0.5) / uScale + 0.5 + uOffset;
           }
 
+          // Sample with slight blur for softness (especially at edges)
           vec4 texel = texture2D(tDiffuse, uv);
+          if(uIsCenter > 0.5) {
+            vec2 dUv = vUv - 0.5;
+            float dist = length(dUv);
+            float blurAmount = smoothstep(0.3, 0.8, dist) * 0.003;
+            texel += texture2D(tDiffuse, uv + vec2(blurAmount, 0.0));
+            texel += texture2D(tDiffuse, uv + vec2(-blurAmount, 0.0));
+            texel += texture2D(tDiffuse, uv + vec2(0.0, blurAmount));
+            texel += texture2D(tDiffuse, uv + vec2(0.0, -blurAmount));
+            texel /= 5.0;
+          }
+          
           float gray = dot(texel.rgb, vec3(0.299, 0.587, 0.114));
           
           vec3 color = vec3(gray); 
           
           if(uIsCenter > 0.5) {
+            // Vignette
             vec2 dUv = vUv - 0.5;
             float dist = length(dUv);
             float vignette = smoothstep(0.8, 0.2, dist);
             color *= vignette;
+            
+            // Enhanced scan lines (more prominent)
+            float scanLine = sin(vUv.y * 1200.0 + uTime * 2.0) * 0.03 + 1.0;
+            scanLine += sin(vUv.y * 600.0 + uTime) * 0.02;
+            color *= scanLine;
+            
+            // Add noise/grain
+            float grain = noise(vUv * 800.0 + uTime * 0.1) * 0.08;
+            color += grain - 0.04;
+            
+            // Slight contrast boost for surveillance look
+            color = pow(color, vec3(0.95));
+            color = color * 1.1 - 0.05;
+            // Darken center screen
+            color *= 0.7;
+          } else {
+            // Subtle scan lines for other screens
+            color -= sin(vUv.y * 800.0 + uTime) * 0.02;
           }
-          
-          color -= sin(vUv.y * 800.0 + uTime) * 0.02;
           
           if(uIsTargeted > 0.5) {
             float border = smoothstep(0.47, 0.5, max(abs(vUv.x - 0.5), abs(vUv.y - 0.5)));
@@ -96,6 +158,7 @@ const Surveillance = () => {
   const [motionPos, setMotionPos] = useState({ x: 0.5, y: 0.5, active: false });
   const [selectionIndex, setSelectionIndex] = useState(0); 
   const [location, setLocation] = useState(null);
+  const [recordingTime, setRecordingTime] = useState(0);
   const videoRef = useRef(null);
   const canvasRef = useRef(document.createElement('canvas'));
   const prevFrame = useRef(null);
@@ -109,10 +172,28 @@ const Surveillance = () => {
   useEffect(() => {
     if (!videoReady) return;
     const interval = setInterval(() => {
-      setSelectionIndex((prev) => (prev + 1) % 9);
+      setSelectionIndex((prev) => {
+        const candidates = [0, 1, 2, 3, 4, 5, 6, 7, 8].filter((n) => n !== prev);
+        return candidates[Math.floor(Math.random() * candidates.length)];
+      });
     }, 4000);
     return () => clearInterval(interval);
   }, [videoReady]);
+
+  useEffect(() => {
+    if (!videoReady) return;
+    const interval = setInterval(() => {
+      setRecordingTime((prev) => prev + 1);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [videoReady]);
+
+  const formatTime = (seconds) => {
+    const hrs = Math.floor(seconds / 3600).toString().padStart(2, '0');
+    const mins = Math.floor((seconds % 3600) / 60).toString().padStart(2, '0');
+    const secs = (seconds % 60).toString().padStart(2, '0');
+    return `${hrs}:${mins}:${secs}`;
+  };
 
   useEffect(() => {
     if (!videoReady) return;
@@ -174,6 +255,16 @@ const Surveillance = () => {
                 />
               </Suspense>
             </Canvas>
+            <div className="osd-overlay">
+              <div className="osd-top-left">
+                <div className="osd-line">REC. {formatTime(recordingTime)}</div>
+                <div className="osd-line">100_{formatTime(recordingTime)}</div>
+                <div className="osd-line">ACA_25FPS</div>
+              </div>
+              <div className="osd-top-right">
+                <div className="osd-line">REC. LIVE FEED</div>
+              </div>
+            </div>
           </div>
         );
       } else {
