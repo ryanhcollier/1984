@@ -3,7 +3,7 @@ import { Canvas, useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
 import './Surveillance.css';
 
-const SecurityScreen = ({ video, motionPos }) => {
+const SecurityScreen = ({ video, motionPos, isTargeted, isCenter }) => {
   const materialRef = useRef();
   const shaderArgs = useMemo(() => {
     const tex = new THREE.VideoTexture(video);
@@ -11,10 +11,11 @@ const SecurityScreen = ({ video, motionPos }) => {
       uniforms: { 
         tDiffuse: { value: tex },
         uTime: { value: 0.0 },
-        uStrength: { value: 0.5 },
+        uStrength: { value: 0.4 },
         uScale: { value: 1.0 },
         uOffset: { value: new THREE.Vector2(0, 0) },
-        uBlur: { value: 0.0 }
+        uIsTargeted: { value: isTargeted ? 1.0 : 0.0 },
+        uIsCenter: { value: isCenter ? 1.0 : 0.0 }
       },
       vertexShader: `
         varying vec2 vUv;
@@ -29,45 +30,55 @@ const SecurityScreen = ({ video, motionPos }) => {
         uniform float uStrength;
         uniform float uScale;
         uniform vec2 uOffset;
-        uniform float uBlur;
+        uniform float uIsTargeted;
+        uniform float uIsCenter;
         varying vec2 vUv;
 
         void main() {
-          vec2 uv = (vUv - 0.5) / uScale + 0.5 + uOffset;
-          vec2 dUv = uv - 0.5;
-          float dist = length(dUv);
-          uv += dUv * dist * dist * uStrength;
-
-          vec4 texel = texture2D(tDiffuse, uv);
-          if(uBlur > 0.001) {
-             texel += texture2D(tDiffuse, uv + vec2(uBlur, 0.0));
-             texel += texture2D(tDiffuse, uv - vec2(uBlur, 0.0));
-             texel /= 3.0;
+          vec2 uv = vUv;
+          
+          if(uIsTargeted > 0.5) {
+            uv = (vUv - 0.5) / uScale + 0.5 + uOffset;
           }
 
+          vec4 texel = texture2D(tDiffuse, uv);
           float gray = dot(texel.rgb, vec3(0.299, 0.587, 0.114));
-          gray += (fract(sin(dot(vUv + uTime, vec2(12.9, 78.2))) * 437.5) * 0.03) - (sin(vUv.y * 1100.0) * 0.015);
           
-          gl_FragColor = vec4(vec3(gray), 1.0);
+          vec3 color = vec3(gray); 
+          
+          if(uIsCenter > 0.5) {
+            vec2 dUv = vUv - 0.5;
+            float dist = length(dUv);
+            float vignette = smoothstep(0.8, 0.2, dist);
+            color *= vignette;
+          }
+          
+          color -= sin(vUv.y * 800.0 + uTime) * 0.02;
+          
+          if(uIsTargeted > 0.5) {
+            float border = smoothstep(0.47, 0.5, max(abs(vUv.x - 0.5), abs(vUv.y - 0.5)));
+            color += vec3(border * 0.3); 
+            color *= 1.0 + sin(uTime * 12.0) * 0.07;
+          }
+
+          gl_FragColor = vec4(color, 1.0);
         }
       `
     };
-  }, [video]);
+  }, [video, isTargeted, isCenter]);
 
   useFrame((state) => {
-    const t = state.clock.getElapsedTime();
     if (materialRef.current) {
-      materialRef.current.uniforms.uTime.value = t;
-      
-      const target = new THREE.Vector2((motionPos.x - 0.5) * 0.6, (0.5 - motionPos.y) * 0.4);
-      materialRef.current.uniforms.uOffset.value.lerp(target, 0.05);
-
-      if (motionPos.active) {
-        materialRef.current.uniforms.uScale.value = THREE.MathUtils.lerp(materialRef.current.uniforms.uScale.value, 2.5, 0.02);
-        materialRef.current.uniforms.uBlur.value = Math.abs(Math.sin(t * 2.0)) * 0.003;
+      materialRef.current.uniforms.uTime.value = state.clock.getElapsedTime();
+      if (isTargeted) {
+        const target = new THREE.Vector2((motionPos.x - 0.5) * 0.4, (0.5 - motionPos.y) * 0.3);
+        materialRef.current.uniforms.uOffset.value.lerp(target, 0.05);
+        materialRef.current.uniforms.uScale.value = motionPos.active ? 
+          THREE.MathUtils.lerp(materialRef.current.uniforms.uScale.value, 1.8, 0.02) : 
+          THREE.MathUtils.lerp(materialRef.current.uniforms.uScale.value, 1.0, 0.01);
       } else {
-        materialRef.current.uniforms.uScale.value = THREE.MathUtils.lerp(materialRef.current.uniforms.uScale.value, 1.0, 0.01);
-        materialRef.current.uniforms.uBlur.value = THREE.MathUtils.lerp(materialRef.current.uniforms.uBlur.value, 0.0, 0.1);
+        materialRef.current.uniforms.uScale.value = 1.0;
+        materialRef.current.uniforms.uOffset.value.set(0, 0);
       }
     }
   });
@@ -83,49 +94,52 @@ const SecurityScreen = ({ video, motionPos }) => {
 const Surveillance = () => {
   const [videoReady, setVideoReady] = useState(false);
   const [motionPos, setMotionPos] = useState({ x: 0.5, y: 0.5, active: false });
-  const [intelQueue, setIntelQueue] = useState([]);
+  const [selectionIndex, setSelectionIndex] = useState(0); 
   const [location, setLocation] = useState(null);
   const videoRef = useRef(null);
   const canvasRef = useRef(document.createElement('canvas'));
   const prevFrame = useRef(null);
 
+  const archivePaths = [
+    '/archive_01.mp4', '/archive_02.mp4', '/archive_03.mp4',
+    '/archive_04.mp4', '/archive_05.mp4', '/archive_06.mp4',
+    '/archive_07.mp4', '/archive_08.mp4'
+  ];
+
+  useEffect(() => {
+    if (!videoReady) return;
+    const interval = setInterval(() => {
+      setSelectionIndex((prev) => (prev + 1) % 9);
+    }, 4000);
+    return () => clearInterval(interval);
+  }, [videoReady]);
+
   useEffect(() => {
     if (!videoReady) return;
     const ctx = canvasRef.current.getContext('2d', { willReadFrequently: true });
-    canvasRef.current.width = 64;
-    canvasRef.current.height = 48;
-
-    const trackMotion = () => {
+    canvasRef.current.width = 64; canvasRef.current.height = 48;
+    const track = () => {
       ctx.drawImage(videoRef.current, 0, 0, 64, 48);
-      const currentFrame = ctx.getImageData(0, 0, 64, 48);
-      
+      const current = ctx.getImageData(0, 0, 64, 48);
       if (prevFrame.current) {
-        let totalX = 0, totalY = 0, count = 0;
-        for (let i = 0; i < currentFrame.data.length; i += 4) {
-          const diff = Math.abs(currentFrame.data[i] - prevFrame.current.data[i]);
-          if (diff > 40) {
-            const pixelIndex = i / 4;
-            totalX += pixelIndex % 64;
-            totalY += Math.floor(pixelIndex / 64);
-            count++;
+        let tx = 0, ty = 0, c = 0;
+        for (let i = 0; i < current.data.length; i += 4) {
+          if (Math.abs(current.data[i] - prevFrame.current.data[i]) > 40) {
+            tx += (i / 4) % 64; ty += Math.floor((i / 4) / 64); c++;
           }
         }
-        if (count > 10) {
-          setMotionPos({ x: totalX / count / 64, y: totalY / count / 48, active: true });
-        } else {
-          setMotionPos(prev => ({ ...prev, active: false }));
-        }
+        if (c > 10) setMotionPos({ x: tx / c / 64, y: ty / c / 48, active: true });
+        else setMotionPos(p => ({ ...p, active: false }));
       }
-      prevFrame.current = currentFrame;
-      requestAnimationFrame(trackMotion);
+      prevFrame.current = current;
+      requestAnimationFrame(track);
     };
-    trackMotion();
+    track();
   }, [videoReady]);
 
   useEffect(() => {
     const video = document.createElement('video');
     video.muted = true; video.playsInline = true; video.autoplay = true;
-    video.style.objectFit = 'cover';
     videoRef.current = video;
     fetch('https://ipwho.is/').then(res => res.json()).then(data => setLocation(data));
   }, []);
@@ -134,49 +148,107 @@ const Surveillance = () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: true });
       videoRef.current.srcObject = stream;
-      videoRef.current.onloadeddata = () => videoRef.current.play().then(() => setVideoReady(true));
+      videoRef.current.play().then(() => setVideoReady(true));
     } catch (err) { alert("Access Denied."); }
   };
 
+  const renderCells = () => {
+    const cells = [];
+    let archiveIdx = 0;
+
+    for (let i = 0; i < 9; i++) {
+      const isSelected = i === selectionIndex;
+      const isCenter = i === 4;
+      
+      if (isCenter) {
+        cells.push(
+          <div key="live-center" className={`grid-cell ${isSelected ? 'live-cell' : ''}`}>
+            <div className={`cam-label ${isSelected ? 'active-target' : ''}`}>LIVE // CAM_{i + 1}</div>
+            <Canvas orthographic>
+              <Suspense fallback={null}>
+                <SecurityScreen 
+                  video={videoRef.current} 
+                  motionPos={motionPos} 
+                  isTargeted={isSelected}
+                  isCenter={true}
+                />
+              </Suspense>
+            </Canvas>
+          </div>
+        );
+      } else {
+        cells.push(
+          <ArchiveCell 
+            key={`archive-${i}`} 
+            src={archivePaths[archiveIdx % 8]} 
+            index={i} 
+            isSelected={isSelected}
+          />
+        );
+        archiveIdx++;
+      }
+    }
+    return cells;
+  };
+
   return (
-    <div className="canvas-container">
+    <div className="surveillance-app">
       {!videoReady ? (
         <div className="boot-screen">
           <div className="ministry-intro">
-            <h1 className="typewriter-title">The Ministry of Love</h1>
-            <p className="typewriter-text">War is peace. Freedom is slavery. Ignorance is strength</p>
-            <button className="init-btn main-btn" onClick={handleStart}>Start Watching</button>
+            {/* Logo included here */}
+            <img src="/logo.png" alt="Division Logo" className="landing-logo" />
+            <h1 className="typewriter-title reduced-title">Thought Police // Surveillance Division</h1>
+            <p className="typewriter-text">War is peace.</p>
+            <p className="typewriter-text">Freedom is slavery.</p>
+            <p className="typewriter-text">Ignorance is strength</p>
+            <button className="init-btn" onClick={handleStart}>Launch Telescreen</button>
           </div>
         </div>
       ) : (
         <>
           <div className="telemetry-sidebar left">
-            <div className="sys-header">
-              // BIG BROTHER <br />
-              // THOUGHT CRIME REPORTING DIV. <br />
-              // Active_Intel_Stream
-            </div>
+            <div className="sys-header">// BIG BROTHER <br /> // THOUGHT CRIME REPORTING DIV.</div>
             <div className="intel-stack">
-              {motionPos.active && <div className="intel-line warning">MOTION_CRIME_DETECTED</div>}
-              <div className="intel-line">POS_X: {motionPos.x.toFixed(2)}</div>
-              <div className="intel-line">POS_Y: {motionPos.y.toFixed(2)}</div>
+              {selectionIndex === 4 && motionPos.active && <div className="intel-line warning">CENTER_ANOMALY_DETECTED</div>}
+              <div className="intel-line">ACTIVE_SCAN: SECTOR_{selectionIndex + 1}</div>
             </div>
           </div>
           <div className="telemetry-sidebar right">
-             <div className="recording-status">
-               <span className="rec-text">LIVE_CV_TRACKING</span>
-               <div className="rec-dot" />
-             </div>
-             <div className="sys-header">TARGET_QUADRANT: {location?.city?.toUpperCase()}</div>
-             <div className="log-entry">IP_RECOGNITION: {location?.ip}</div>
+             <div className="recording-status"><span className="rec-text">LIVE_CV_TRACKING</span><div className="rec-dot" /></div>
+             <div className="sys-header">QUADRANT: {location?.city?.toUpperCase() || "LOCATING..."}</div>
           </div>
-          <Canvas orthographic>
-            <Suspense fallback={null}>
-              <SecurityScreen video={videoRef.current} motionPos={motionPos} />
-            </Suspense>
-          </Canvas>
+          <div className="monitor-grid">
+            {renderCells()}
+          </div>
         </>
       )}
+    </div>
+  );
+};
+
+const ArchiveCell = ({ src, index, isSelected }) => {
+  const video = useMemo(() => {
+    const v = document.createElement('video');
+    v.src = src; v.loop = true; v.muted = true; v.play();
+    return v;
+  }, [src]);
+
+  return (
+    <div className="grid-cell" style={{ border: isSelected ? '2px solid #ffffff' : '1px solid #333' }}>
+      <div className={`cam-label ${isSelected ? 'active-target' : ''}`}>
+        LIVE // CAM_{index + 1}
+      </div>
+      <Canvas orthographic>
+        <Suspense fallback={null}>
+          <SecurityScreen 
+            video={video} 
+            isTargeted={isSelected} 
+            motionPos={{x:0.5, y:0.5, active: false}} 
+            isCenter={false}
+          />
+        </Suspense>
+      </Canvas>
     </div>
   );
 };
