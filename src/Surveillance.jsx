@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, Suspense, useMemo } from 'react';
+import React, { useState, useEffect, useRef, Suspense, useMemo, useCallback } from 'react';
 import { Canvas, useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
 import './Surveillance.css';
@@ -36,7 +36,6 @@ const SecurityScreen = ({ video, motionPos, isTargeted, isCenter }) => {
         uniform float uFisheyeStrength;
         varying vec2 vUv;
 
-        // Simple noise function
         float random(vec2 st) {
           return fract(sin(dot(st.xy, vec2(12.9898,78.233))) * 43758.5453123);
         }
@@ -54,27 +53,17 @@ const SecurityScreen = ({ video, motionPos, isTargeted, isCenter }) => {
 
         void main() {
           vec2 uv = vUv;
-          
-          // Apply fisheye distortion for center screen (barrel distortion)
           if(uIsCenter > 0.5) {
             vec2 center = vec2(0.5, 0.5);
             vec2 dUv = vUv - center;
             float dist = length(dUv);
-            
-            // Apply barrel distortion: compress sampling coordinates toward center
-            // This creates fisheye effect while keeping video full screen
             float distortionFactor = 1.0 - uFisheyeStrength * dist * dist * 0.5;
             vec2 fisheyeUv = center + dUv * distortionFactor;
-            
-            // Ensure we stay within valid UV range
             uv = clamp(fisheyeUv, 0.0, 1.0);
           }
-          
           if(uIsTargeted > 0.5) {
             uv = (uv - 0.5) / uScale + 0.5 + uOffset;
           }
-
-          // Sample with slight blur for softness (especially at edges)
           vec4 texel = texture2D(tDiffuse, uv);
           if(uIsCenter > 0.5) {
             vec2 dUv = vUv - 0.5;
@@ -86,43 +75,29 @@ const SecurityScreen = ({ video, motionPos, isTargeted, isCenter }) => {
             texel += texture2D(tDiffuse, uv + vec2(0.0, -blurAmount));
             texel /= 5.0;
           }
-          
           float gray = dot(texel.rgb, vec3(0.299, 0.587, 0.114));
-          
           vec3 color = vec3(gray); 
-          
           if(uIsCenter > 0.5) {
-            // Vignette
             vec2 dUv = vUv - 0.5;
             float dist = length(dUv);
             float vignette = smoothstep(0.8, 0.2, dist);
             color *= vignette;
-            
-            // Enhanced scan lines (more prominent)
             float scanLine = sin(vUv.y * 1200.0 + uTime * 2.0) * 0.03 + 1.0;
             scanLine += sin(vUv.y * 600.0 + uTime) * 0.02;
             color *= scanLine;
-            
-            // Add noise/grain
             float grain = noise(vUv * 800.0 + uTime * 0.1) * 0.08;
             color += grain - 0.04;
-            
-            // Slight contrast boost for surveillance look
             color = pow(color, vec3(0.95));
             color = color * 1.1 - 0.05;
-            // Darken center screen
             color *= 0.7;
           } else {
-            // Subtle scan lines for other screens
             color -= sin(vUv.y * 800.0 + uTime) * 0.02;
           }
-          
           if(uIsTargeted > 0.5) {
             float border = smoothstep(0.47, 0.5, max(abs(vUv.x - 0.5), abs(vUv.y - 0.5)));
             color += vec3(border * 0.3); 
             color *= 1.0 + sin(uTime * 12.0) * 0.07;
           }
-
           gl_FragColor = vec4(color, 1.0);
         }
       `
@@ -153,21 +128,90 @@ const SecurityScreen = ({ video, motionPos, isTargeted, isCenter }) => {
   );
 };
 
+const DynamicArchiveCell = ({ index, isSelected, currentPath, onSwitchRequest }) => {
+  const video = useMemo(() => {
+    const v = document.createElement('video');
+    v.src = currentPath;
+    v.loop = true;
+    v.muted = true;
+    v.play();
+    return v;
+  }, [currentPath]);
+
+  useEffect(() => {
+    // Determine play duration: Strictly 5s for archive_12, otherwise random 5-8s
+    const isSpecial = currentPath.includes('archive_12');
+    const playDuration = isSpecial ? 5000 : Math.floor(Math.random() * (8000 - 5000 + 1) + 5000);
+    
+    const timeout = setTimeout(() => {
+      onSwitchRequest(index);
+    }, playDuration);
+    return () => clearTimeout(timeout);
+  }, [currentPath, index, onSwitchRequest]);
+
+  return (
+    <div className="grid-cell" style={{ border: isSelected ? '2px solid #ffffff' : '1px solid #333' }}>
+      <div className={`cam-label ${isSelected ? 'active-target' : ''}`}>LIVE // CAM_{index + 1}</div>
+      <Canvas orthographic>
+        <Suspense fallback={null}>
+          <SecurityScreen 
+            video={video} 
+            isTargeted={isSelected} 
+            motionPos={{x:0.5, y:0.5, active: false}} 
+            isCenter={false}
+          />
+        </Suspense>
+      </Canvas>
+    </div>
+  );
+};
+
 const Surveillance = () => {
   const [videoReady, setVideoReady] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
   const [motionPos, setMotionPos] = useState({ x: 0.5, y: 0.5, active: false });
   const [selectionIndex, setSelectionIndex] = useState(0); 
   const [location, setLocation] = useState(null);
   const [recordingTime, setRecordingTime] = useState(0);
+
+  // Pool management: Updated to handle up to 15 videos
+  const archivePool = useMemo(() => {
+    return Array.from({ length: 15 }, (_, i) => `/archive_${(i + 1).toString().padStart(2, '0')}.mp4`);
+  }, []);
+
+  const [activePaths, setActivePaths] = useState({
+    0: archivePool[0], 1: archivePool[1], 2: archivePool[2], 
+    3: archivePool[3], 5: archivePool[4], 6: archivePool[5], 
+    7: archivePool[6], 8: archivePool[7]
+  });
+
+  const lastSpecialPull = useRef(0);
   const videoRef = useRef(null);
+  const audioRef = useRef(null);
   const canvasRef = useRef(document.createElement('canvas'));
   const prevFrame = useRef(null);
 
-  const archivePaths = [
-    '/archive_01.mp4', '/archive_02.mp4', '/archive_03.mp4',
-    '/archive_04.mp4', '/archive_05.mp4', '/archive_06.mp4',
-    '/archive_07.mp4', '/archive_08.mp4'
-  ];
+  const handleSwitchRequest = useCallback((index) => {
+    setActivePaths(prev => {
+      const currentInUse = Object.values(prev);
+      const currentTime = Date.now();
+      let candidates = archivePool.filter(path => !currentInUse.includes(path));
+      
+      const isSpecialAvailable = (currentTime - lastSpecialPull.current) > 30000;
+      if (!isSpecialAvailable) {
+        candidates = candidates.filter(path => !path.includes('archive_12'));
+      }
+      
+      if (candidates.length === 0) return prev; 
+      const nextPath = candidates[Math.floor(Math.random() * candidates.length)];
+      
+      if (nextPath.includes('archive_12')) {
+        lastSpecialPull.current = currentTime;
+      }
+      
+      return { ...prev, [index]: nextPath };
+    });
+  }, [archivePool]);
 
   useEffect(() => {
     if (!videoReady) return;
@@ -222,64 +266,29 @@ const Surveillance = () => {
     const video = document.createElement('video');
     video.muted = true; video.playsInline = true; video.autoplay = true;
     videoRef.current = video;
+
+    const audio = new Audio('/music.mp3');
+    audio.loop = true;
+    audioRef.current = audio;
+
     fetch('https://ipwho.is/').then(res => res.json()).then(data => setLocation(data));
   }, []);
+
+  const toggleAudio = () => {
+    if (audioRef.current) {
+      audioRef.current.muted = !audioRef.current.muted;
+      setIsMuted(audioRef.current.muted);
+    }
+  };
 
   const handleStart = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: true });
       videoRef.current.srcObject = stream;
-      videoRef.current.play().then(() => setVideoReady(true));
+      videoRef.current.play();
+      if (audioRef.current) audioRef.current.play();
+      setVideoReady(true);
     } catch (err) { alert("Access Denied."); }
-  };
-
-  const renderCells = () => {
-    const cells = [];
-    let archiveIdx = 0;
-
-    for (let i = 0; i < 9; i++) {
-      const isSelected = i === selectionIndex;
-      const isCenter = i === 4;
-      
-      if (isCenter) {
-        cells.push(
-          <div key="live-center" className={`grid-cell ${isSelected ? 'live-cell' : ''}`}>
-            <div className={`cam-label ${isSelected ? 'active-target' : ''}`}>LIVE // CAM_{i + 1}</div>
-            <Canvas orthographic>
-              <Suspense fallback={null}>
-                <SecurityScreen 
-                  video={videoRef.current} 
-                  motionPos={motionPos} 
-                  isTargeted={isSelected}
-                  isCenter={true}
-                />
-              </Suspense>
-            </Canvas>
-            <div className="osd-overlay">
-              <div className="osd-top-left">
-                <div className="osd-line">REC. {formatTime(recordingTime)}</div>
-                <div className="osd-line">100_{formatTime(recordingTime)}</div>
-                <div className="osd-line">ACA_25FPS</div>
-              </div>
-              <div className="osd-top-right">
-                <div className="osd-line">REC. LIVE FEED</div>
-              </div>
-            </div>
-          </div>
-        );
-      } else {
-        cells.push(
-          <ArchiveCell 
-            key={`archive-${i}`} 
-            src={archivePaths[archiveIdx % 8]} 
-            index={i} 
-            isSelected={isSelected}
-          />
-        );
-        archiveIdx++;
-      }
-    }
-    return cells;
   };
 
   return (
@@ -287,17 +296,28 @@ const Surveillance = () => {
       {!videoReady ? (
         <div className="boot-screen">
           <div className="ministry-intro">
-            {/* Logo included here */}
-            <img src="/logo.png" alt="Division Logo" className="landing-logo" />
-            <h1 className="typewriter-title reduced-title">Thought Police // Surveillance Division</h1>
-            <p className="typewriter-text">War is peace.</p>
-            <p className="typewriter-text">Freedom is slavery.</p>
-            <p className="typewriter-text">Ignorance is strength</p>
-            <button className="init-btn" onClick={handleStart}>Launch Telescreen</button>
+            <img src="/logo.png" alt="Division Logo" className="landing-logo fade-in-line" style={{'--delay': '0.2s'}} />
+            <h1 className="reduced-title fade-in-line" style={{'--delay': '1s'}}>Thought Police // Surveillance Division</h1>
+            <p className="typewriter-text fade-in-line" style={{'--delay': '1.8s'}}>War is peace.</p>
+            <p className="typewriter-text fade-in-line" style={{'--delay': '2.6s'}}>Freedom is slavery.</p>
+            <p className="typewriter-text fade-in-line" style={{'--delay': '3.4s'}}>Ignorance is strength</p>
+            <button className="init-btn fade-in-line" onClick={handleStart} style={{'--delay': '4.5s'}}>Launch Telescreen</button>
           </div>
         </div>
       ) : (
         <>
+          <div className="top-center-controls">
+            <button className="audio-toggle-btn-small" onClick={toggleAudio}>
+              AUDIO: {isMuted ? 'OFF' : 'ON'}
+            </button>
+          </div>
+
+          <div className="bottom-center-attribution">
+            <div className="audio-attribution-sidebar">
+              Music by <a href="https://pixabay.com/users/litesaturation-17654080/">LiteSaturation</a> from <a href="https://pixabay.com//">Pixabay</a>
+            </div>
+          </div>
+
           <div className="telemetry-sidebar left">
             <div className="sys-header">// BIG BROTHER <br /> // THOUGHT CRIME REPORTING DIV.</div>
             <div className="intel-stack">
@@ -305,41 +325,35 @@ const Surveillance = () => {
               <div className="intel-line">ACTIVE_SCAN: SECTOR_{selectionIndex + 1}</div>
             </div>
           </div>
+
           <div className="telemetry-sidebar right">
              <div className="recording-status"><span className="rec-text">LIVE_CV_TRACKING</span><div className="rec-dot" /></div>
              <div className="sys-header">QUADRANT: {location?.city?.toUpperCase() || "LOCATING..."}</div>
           </div>
+
           <div className="monitor-grid">
-            {renderCells()}
+            {[...Array(9)].map((_, i) => (
+              i === 4 ? (
+                <div key="live-center" className={`grid-cell ${selectionIndex === 4 ? 'live-cell' : ''}`}>
+                  <div className={`cam-label ${selectionIndex === 4 ? 'active-target' : ''}`}>LIVE // CAM_5</div>
+                  <Canvas orthographic>
+                    <Suspense fallback={null}>
+                      <SecurityScreen video={videoRef.current} motionPos={motionPos} isTargeted={selectionIndex === 4} isCenter={true} />
+                    </Suspense>
+                  </Canvas>
+                  <div className="osd-overlay">
+                    <div className="osd-top-left">
+                      <div className="osd-line">REC. {formatTime(recordingTime)}</div>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <DynamicArchiveCell key={i} index={i} isSelected={i === selectionIndex} currentPath={activePaths[i]} onSwitchRequest={handleSwitchRequest} />
+              )
+            ))}
           </div>
         </>
       )}
-    </div>
-  );
-};
-
-const ArchiveCell = ({ src, index, isSelected }) => {
-  const video = useMemo(() => {
-    const v = document.createElement('video');
-    v.src = src; v.loop = true; v.muted = true; v.play();
-    return v;
-  }, [src]);
-
-  return (
-    <div className="grid-cell" style={{ border: isSelected ? '2px solid #ffffff' : '1px solid #333' }}>
-      <div className={`cam-label ${isSelected ? 'active-target' : ''}`}>
-        LIVE // CAM_{index + 1}
-      </div>
-      <Canvas orthographic>
-        <Suspense fallback={null}>
-          <SecurityScreen 
-            video={video} 
-            isTargeted={isSelected} 
-            motionPos={{x:0.5, y:0.5, active: false}} 
-            isCenter={false}
-          />
-        </Suspense>
-      </Canvas>
     </div>
   );
 };
